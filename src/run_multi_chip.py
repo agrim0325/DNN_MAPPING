@@ -485,13 +485,15 @@ if HAS_TORCH:
             self.tau = tau
             self.ou_state = np.zeros(action_dim, dtype=np.float32)
 
-        def select_action(self, state, noise_scale=0.1):
+        def select_action(self, state, noise_scale=0.1, explore=True):
             state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             self.actor.eval()
             with torch.no_grad():
                 action = self.actor(state).squeeze(0).cpu().numpy()
             self.actor.train()
-            # Add exploration noise
+            if not explore:
+                return action
+            # Add exploration noise.
             # Ornstein-Uhlenbeck exploration used by the paper (Sec. 3.2).
             self.ou_state += 0.15 * (0.0 - self.ou_state) + 0.2 * np.random.randn(self.action_dim)
             action += noise_scale * self.ou_state
@@ -499,7 +501,7 @@ if HAS_TORCH:
 
         def train(self, replay_buffer, batch_size=64):
             if len(replay_buffer) < batch_size:
-                return
+                return None
 
             states, actions, rewards, next_states, dones = replay_buffer.sample(batch_size)
 
@@ -534,6 +536,8 @@ if HAS_TORCH:
                 target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
             for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
                 target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+            return {"actor_loss": float(actor_loss.detach().cpu()),
+                    "critic_loss": float(critic_loss.detach().cpu())}
 
         def state_dict(self) -> dict:
             """Everything needed to exactly resume this agent's networks/optimizers."""
@@ -585,6 +589,7 @@ class MultiChipCoreMapper:
         self._placement = np.full(self.num_tasks, -1, dtype=np.int32)
         self._occupied  = set()
         self._task_ptr  = 0
+        self.collision_repairs = 0
         self.baseline_latency = baseline_latency
         if baseline_latency is None:
             print("[WARN] MultiChipCoreMapper created without baseline_latency -- "
@@ -595,6 +600,7 @@ class MultiChipCoreMapper:
         self._placement[:] = -1
         self._occupied.clear()
         self._task_ptr = 0
+        self.collision_repairs = 0
         self.env.reset()
         return self._occ_map()
 
@@ -660,6 +666,7 @@ class MultiChipCoreMapper:
         if intended_core not in self._occupied:
             core_id = intended_core
         else:
+            self.collision_repairs += 1
             total = self.total_rows * self.total_cols
             occupied_mask = np.zeros(total, dtype=bool)
             if self._occupied:
@@ -738,7 +745,8 @@ class MultiChipCoreMapper:
 def run_ddpg(env: MultiChipEnvironment, n_episodes: int = 500, batch_size: int = 64,
              baseline_trials: int = 1000, batch_z: int = 3, train_every: int = 5,
              device: str = None, save_checkpoint: str = None, load_checkpoint: str = None,
-             checkpoint_every: int = 100) -> float:
+             checkpoint_every: int = 100, diagnostics_path: str = None,
+             run_metadata: dict = None) -> float:
     if not HAS_TORCH:
         raise RuntimeError("DDPG requires PyTorch; refusing a random-search fallback")
 
@@ -792,6 +800,13 @@ def run_ddpg(env: MultiChipEnvironment, n_episodes: int = 500, batch_size: int =
           + (f" ({torch.get_num_threads()} CPU threads)" if agent.device.type == "cpu" else ""))
     replay_buffer = ReplayBuffer()
     mapper = MultiChipCoreMapper(env, baseline_latency=baseline_latency, batch_z=batch_z)
+    diagnostics_stream = None
+    if diagnostics_path is not None:
+        parent = os.path.dirname(diagnostics_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        diagnostics_stream = open(diagnostics_path, "w", encoding="utf-8")
+        print(f"[DDPG] Writing per-episode diagnostics to {diagnostics_path}")
 
     if checkpoint is not None:
         agent.load_state_dict(checkpoint["agent"])
@@ -856,16 +871,20 @@ def run_ddpg(env: MultiChipEnvironment, n_episodes: int = 500, batch_size: int =
         state = mapper.reset()
         agent.ou_state.fill(0)
         done = False
+        actions, losses = [], []
 
         while not done:
             action = agent.select_action(state, noise_scale=noise_scale)
+            actions.append(action.copy())
             reward, done, grid, final_cost = mapper.step(action)
             next_state = mapper._occ_map()
 
             replay_buffer.add(state, action, reward, next_state, done)
             global_step += 1
             if global_step % train_every == 0:
-                agent.train(replay_buffer, batch_size)
+                loss = agent.train(replay_buffer, batch_size)
+                if loss is not None:
+                    losses.append(loss)
             state = next_state
 
         noise_scale = max(0.01, noise_scale * noise_decay)
@@ -874,6 +893,39 @@ def run_ddpg(env: MultiChipEnvironment, n_episodes: int = 500, batch_size: int =
             best_cost = final_cost          
             best_grid   = grid
             best_placement = mapper.get_placement()
+
+        if diagnostics_stream is not None:
+            # Evaluate the actor without OU noise. This is deliberately a
+            # separate rollout: it answers whether the trained policy itself
+            # is useful, rather than whether a lucky noisy action was useful.
+            evaluation_mapper = MultiChipCoreMapper(env, baseline_latency=baseline_latency,
+                                                     batch_z=batch_z)
+            evaluation_state = evaluation_mapper.reset()
+            evaluation_done = False
+            while not evaluation_done:
+                deterministic_action = agent.select_action(evaluation_state, explore=False)
+                _, evaluation_done, _, deterministic_cost = evaluation_mapper.step(deterministic_action)
+                evaluation_state = evaluation_mapper._occ_map()
+            # Preserve the noisy episode placement for checkpointing/final output.
+            env.place(mapper.get_placement())
+            action_values = np.concatenate(actions) if actions else np.array([], dtype=np.float32)
+            record = {
+                "episode": ep,
+                "current_cost": final_cost,
+                "best_cost": best_cost,
+                "deterministic_cost": deterministic_cost,
+                "reward": reward,
+                "noise_scale": noise_scale,
+                "collision_repairs": mapper.collision_repairs,
+                "action_mean": float(action_values.mean()) if len(action_values) else None,
+                "action_std": float(action_values.std()) if len(action_values) else None,
+                "action_saturated_fraction": float(np.mean(np.abs(action_values) >= 0.999)) if len(action_values) else None,
+                "actor_loss_mean": float(np.mean([item["actor_loss"] for item in losses])) if losses else None,
+                "critic_loss_mean": float(np.mean([item["critic_loss"] for item in losses])) if losses else None,
+                "gradient_updates": len(losses),
+            }
+            diagnostics_stream.write(json.dumps(record, allow_nan=False) + "\n")
+            diagnostics_stream.flush()
 
         if ep % 10 == 0 or ep == n_episodes:
             elapsed = time.time() - start_time
@@ -890,6 +942,13 @@ def run_ddpg(env: MultiChipEnvironment, n_episodes: int = 500, batch_size: int =
     if save_checkpoint is not None and n_episodes > start_episode:
         _save_checkpoint(n_episodes)
         print(f"[DDPG] Final checkpoint saved to {save_checkpoint}")
+
+    if diagnostics_stream is not None:
+        diagnostics_stream.close()
+    if run_metadata is not None:
+        run_metadata.update({"baseline_cost": baseline_latency, "start_episode": start_episode,
+                             "end_episode": n_episodes, "global_steps": global_step,
+                             "final_noise_scale": noise_scale, "diagnostics_path": diagnostics_path})
 
     if best_grid:
         print("--- Current Best Layout ---")
@@ -1079,6 +1138,7 @@ def main():
     parser.add_argument("--timing_model", choices=["proxy", "full_frame"], default="proxy",
                          help="full_frame: compute + byte-hop serialization in seconds; approximate, no streaming/contention")
     parser.add_argument("--report", help="Write configuration, objective units, best placement and runtime as JSON")
+    parser.add_argument("--diagnostics", help="Optional JSONL path for per-episode DDPG diagnostics: noisy and deterministic costs, reward, OU noise, collisions, action statistics, and losses")
     parser.add_argument("--vva_ops_per_cycle", type=float, default=1.0,
                          help="Assumed VVA additions/cycle, not specified by paper (default 1)")
     parser.add_argument("--on_bandwidth_gbs", type=float, default=64.0)
@@ -1202,12 +1262,14 @@ def main():
     # 3. Run the algorithms
     run_started = time.perf_counter()
     if args.algo == "ddpg":
+        ddpg_metadata = {}
         cost = run_ddpg(env, n_episodes=args.epochs, batch_z=args.batch_z,
                          baseline_trials=args.baseline_trials,
                          train_every=args.train_every, device=args.device,
                          save_checkpoint=args.save_checkpoint,
                          load_checkpoint=args.load_checkpoint,
-                         checkpoint_every=args.checkpoint_every)
+                         checkpoint_every=args.checkpoint_every,
+                         diagnostics_path=args.diagnostics, run_metadata=ddpg_metadata)
     elif args.algo == "sa":
         cost = run_sa(env, n_iter=args.iters)
     else:
@@ -1219,6 +1281,9 @@ def main():
     print(f"  Off-chip comm cost : {bd['off_chip_cost']:.6g}")
     print(f"  Chip placement     : {env.placement[:env.num_tasks]}")
     if args.report:
+        report_parent = os.path.dirname(args.report)
+        if report_parent:
+            os.makedirs(report_parent, exist_ok=True)
         with open(args.report, "w") as stream:
             json.dump({"config": vars(args), "tasks": env.num_tasks,
                        "objective_units": env.timing_units, "best_cost": cost,
@@ -1226,6 +1291,7 @@ def main():
                        "seconds_elapsed": time.perf_counter() - run_started,
                        "torch_version": torch.__version__ if HAS_TORCH else None,
                        "cuda_available": HAS_TORCH and torch.cuda.is_available(),
+                       "ddpg_metadata": ddpg_metadata if args.algo == "ddpg" else None,
                        "limitations": ["MLP policy, not paper CNN", "no shared-link contention",
                            "no block-streaming schedule", "uniform channel partitioning",
                            "full_frame excludes residual/concat timing", "replay not persisted"]},

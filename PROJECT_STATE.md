@@ -169,6 +169,15 @@ For a larger measurement, explicitly increase partition/grid/episode settings
 after the small validation passes. Compare CPU and CUDA with the same config;
 the profiler does not automatically prove or compute a speedup.
 
+`src/run_multiseed_experiment.py` now provides the next experimental step: it
+runs DDPG, random search and SA serially across a declared seed list with the
+same complete-placement evaluation count, and writes a summary with mean,
+sample standard deviation, minimum and maximum best cost. DDPG accepts an
+optional `--diagnostics` JSONL output with each episode's noisy and
+deterministic policy costs, reward, OU scale, collision repairs, action
+statistics, and actor/critic losses. This records evidence; it does not change
+the sparse reward or make the MLP DDPG policy equivalent to the paper's CNN.
+
 ## Next priorities
 
 CPU validation completed on 2026-09-11 with Torch 2.14.0+cpu: both maintained

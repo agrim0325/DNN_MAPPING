@@ -278,6 +278,23 @@ CUDA mode fails explicitly if unavailable. The default CPU run passed with 120
 steps and 57 updates on 2026-09-11. This short check does not establish convergence,
 steady-state memory fit, or GPU speedup; timings include synchronization overhead.
 
+To compare DDPG with matched random-search and SA placement-evaluation budgets
+across five reproducible seeds, run this on the GPU host:
+
+```bash
+python src/run_multiseed_experiment.py \
+  --device cuda --seeds 0,1,2,3,4 --epochs 1000 --baseline_trials 1000 \
+  --model alexnet --channels_per_partition 512 \
+  --output_dir runs/alexnet-five-seed
+```
+
+It writes a `summary.json`, one JSON report and log per method/seed, and a DDPG
+JSONL diagnostics file per seed. Diagnostics record noisy and deterministic
+policy costs, reward, OU noise, collision repairs, action distribution, and
+actor/critic losses. Each method receives 1,000 complete-placement evaluations;
+DDPG's 1,000 baseline trials are separately reported because they normalize its
+sparse reward and are not part of that matched comparison.
+
 1. Reconstruct and validate block-streaming stages and communication contention with explicit assumptions.
 2. Implement compute-aware partitioning and buffer-capacity constraints; the paper's refinement formula is unspecified.
 3. Implement and validate merge arithmetic and separate CONV/FC placement regions.
@@ -298,6 +315,7 @@ src/
   test_multi_chip.py         # Original smoke suite
   test_reconciliation.py     # Reconciliation regression suite
   validate_device.py         # Bounded CPU/CUDA validation and component timings
+  run_multiseed_experiment.py # Reproducible DDPG/RS/SA multi-seed comparison
   run_multi_chip_fast.py     # Historical alternative; not reconciled or validated
   agent/, env/, runner/      # Original single-chip implementation
 RECONCILIATION.md             # Detailed assumptions and reconciliation history
