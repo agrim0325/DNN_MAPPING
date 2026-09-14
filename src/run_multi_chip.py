@@ -164,77 +164,96 @@ if HAS_TORCH:
             labels: human-readable label per task index, for debugging.
         """
         model, dummy_input, warning = _build_model_and_input(model_name)
-        if warning:
-            print(f"[WARN] {warning}")
+        # Note: warning is ignored since fx accurately traces ResNet skip connections.
+        
+        try:
+            import torch.fx
+            from torch.fx.passes.shape_prop import ShapeProp
+        except ImportError:
+            raise RuntimeError("torch.fx is required. Please upgrade PyTorch to use this extractor.")
 
-        # Capture shape info only for Conv2d/Linear -- the only layers
-        # actually partitioned into logic cores (see docstring above).
-        captured = []  # list of (kind, C_in, C_out, H, W)
-
-        def make_hook(kind):
-            def hook_fn(module, inp, out):
-                if kind == "conv":
-                    _, C_out, H, W = out.shape
-                    C_in = module.in_channels
-                else:  # linear
-                    C_out = module.out_features
-                    C_in = module.in_features
-                    H = W = 1
-                captured.append((kind, C_in, C_out, H, W))
-            return hook_fn
-
-        # Walk ALL submodules regardless of container nesting (features /
-        # classifier / avgpool / layer1..layer4 / etc.) -- hooks fire in
-        # actual forward-pass execution order, which is what determines
-        # `captured`'s sequence, not registration order. This works
-        # structurally for any architecture; see the ResNet50 caveat above
-        # for what this order does and doesn't capture correctly.
-        hooks = []
-        for module in model.modules():
-            if isinstance(module, nn.Conv2d):
-                hooks.append(module.register_forward_hook(make_hook("conv")))
-            elif isinstance(module, nn.Linear):
-                hooks.append(module.register_forward_hook(make_hook("linear")))
-
-        with torch.no_grad():
-            model(dummy_input)
-        for h in hooks:
-            h.remove()
-
-        if not captured:
+        print(f">> Extracting {model_name} Workload via torch.fx graph tracing...")
+        
+        # Trace the model into a graph
+        traced = torch.fx.symbolic_trace(model)
+        
+        # Propagate tensor shapes through the graph using dummy_input
+        ShapeProp(traced).propagate(dummy_input)
+        
+        captured_meta = []  # list of (kind, C_in, C_out, H, W, fx_node)
+        
+        # Identify only the partitioned target nodes (Conv2d, Linear)
+        for node in traced.graph.nodes:
+            if node.op == 'call_module':
+                submod = traced.get_submodule(node.target)
+                if isinstance(submod, (nn.Conv2d, nn.Linear)):
+                    shape = node.meta['tensor_meta'].shape
+                    if isinstance(submod, nn.Conv2d):
+                        kind = 'conv'
+                        C_in = submod.in_channels
+                        C_out = submod.out_channels
+                        if len(shape) == 4:
+                            _, _, H, W = shape
+                        else:
+                            H, W = 1, 1
+                    else:
+                        kind = 'linear'
+                        C_in = submod.in_features
+                        C_out = submod.out_features
+                        H = W = 1
+                    captured_meta.append((kind, C_in, C_out, H, W, node))
+                    
+        if not captured_meta:
             raise RuntimeError(
-                f"No Conv2d/Linear layers captured for model '{model_name}' -- "
-                f"check the model built and ran correctly."
+                f"No Conv2d/Linear layers captured for model '{model_name}'."
             )
+            
+        # Map node to its macroscopic layer index for easy edge building
+        node_to_layer_idx = {meta[5]: idx for idx, meta in enumerate(captured_meta)}
+        
+        def get_target_successors(n: torch.fx.Node):
+            """Recursively find the next Conv2d/Linear nodes that consume this node's output, bypassing ReLUs/Pools."""
+            succs = set()
+            for user in n.users.keys():
+                if user in node_to_layer_idx:
+                    succs.add(user)
+                else:
+                    succs.update(get_target_successors(user))
+            return succs
+
+        # Print the per-layer breakdown just like the screenshot!
+        print(f">> Per-layer VMM/VVA breakdown ({model_name}, channels_per_partition={channels_per_partition}, extracted via torch.fx true computational-graph tracing):")
+        print(f"{'Layer':<15} {'Type':<6} {'Cin':>6} {'Cout':>6} {'M':>4} {'N':>4} {'VMM':>5} {'VVA':>5}")
 
         if channels_per_partition <= 0:
-            # Legacy behavior: one task per Conv2d/Linear layer (activation/
-            # pooling layers are no longer separately counted, unlike the
-            # very first version of this extractor).
-            num_tasks = len(captured)
+            num_tasks = len(captured_meta)
             task_graph = np.zeros((num_tasks, num_tasks), dtype=np.float32)
             labels = []
-            for i, (kind, C_in, C_out, H, W) in enumerate(captured):
+            for i, (kind, C_in, C_out, H, W, node) in enumerate(captured_meta):
                 labels.append(f"L{i}_{kind}")
-                if i < num_tasks - 1:
-                    task_graph[i, i + 1] = C_out * H * W
+                layer_name = node.target.split('.')[-1] if '.' in node.target else node.target
+                print(f"{layer_name:<15} {kind:<6} {C_in:>6} {C_out:>6} {'-':>4} {'-':>4} {'-':>5} {'1':>5}")
+                
+                succ_nodes = get_target_successors(node)
+                for succ in succ_nodes:
+                    j = node_to_layer_idx[succ]
+                    task_graph[i, j] += C_out * H * W
             return task_graph, num_tasks, labels
 
-        # --- Channel-partitioned extraction (paper Sec 3.1.1) ---
+        # --- Channel-partitioned extraction (paper Sec 3.1.1) with FX topology ---
         layer_meta = []   # (vmm_ids[M][N], vva_ids[M], M, N, partial_vol)
         labels = []
         edges = []        # (src_id, dst_id, volume)
         next_id = 0
-        prev_M = 1         # first layer's few input channels aren't split
 
-        for L, (kind, C_in, C_out, H, W) in enumerate(captured):
+        for L, (kind, C_in, C_out, H, W, node) in enumerate(captured_meta):
             M = max(1, math.ceil(C_out / channels_per_partition))
-            N = prev_M
+            N = max(1, math.ceil(C_in / channels_per_partition))
 
             vmm_ids = [[None] * N for _ in range(M)]
             vva_ids = [None] * M
             out_per_group = math.ceil(C_out / M)
-            partial_vol = out_per_group * H * W  # VMM/VVA output size for this group
+            partial_vol = out_per_group * H * W
 
             for m in range(M):
                 for n in range(N):
@@ -244,25 +263,38 @@ if HAS_TORCH:
                 vva_ids[m] = next_id
                 labels.append(f"L{L}_{kind}_VVA_m{m}")
                 next_id += 1
+                
                 for n in range(N):
                     edges.append((vmm_ids[m][n], vva_ids[m], partial_vol))
 
             layer_meta.append((vmm_ids, vva_ids, M, N, partial_vol))
-            prev_M = M
+            
+            # Print table row
+            layer_name = node.target.split('.')[-1] if '.' in node.target else node.target
+            print(f"{layer_name:<15} {kind:<6} {C_in:>6} {C_out:>6} {M:>4} {N:>4} {M*N:>5} {M:>5}")
 
-        # VVA(L, m) broadcasts its accumulated output-channel-group slice to
-        # every VMM(L+1, m', n'=m) that consumes it as an input-channel group.
-        for L in range(len(layer_meta) - 1):
+        # Connect VVA -> VMM across macroscopic layers using FX graph successors
+        for L, meta in enumerate(captured_meta):
+            node = meta[5]
             _, vva_ids, M, _, partial_vol = layer_meta[L]
-            vmm_next, _, M_next, _, _ = layer_meta[L + 1]
-            for m in range(M):
-                for m_next in range(M_next):
-                    edges.append((vva_ids[m], vmm_next[m_next][m], partial_vol))
+            
+            succ_nodes = get_target_successors(node)
+            for succ in succ_nodes:
+                L_next = node_to_layer_idx[succ]
+                vmm_next, _, M_next, N_next, _ = layer_meta[L_next]
+                
+                # VVA(L, m) broadcasts its accumulated output to VMM(L_next, m_next, m)
+                for m in range(M):
+                    for m_next in range(M_next):
+                        if m < N_next:
+                            edges.append((vva_ids[m], vmm_next[m_next][m], partial_vol))
 
         num_tasks = next_id
         task_graph = np.zeros((num_tasks, num_tasks), dtype=np.float32)
         for src, dst, vol in edges:
             task_graph[src, dst] += vol
+
+        print(f">> Channel partitioning: channels_per_partition={channels_per_partition} -> {num_tasks} logic cores (VMM+VVA)\n")
 
         return task_graph, num_tasks, labels
 
@@ -277,25 +309,73 @@ if HAS_TORCH:
 
 if HAS_TORCH:
     class Actor(nn.Module):
-        def __init__(self, state_dim, action_dim=2, hidden=256):
+        def __init__(self, rows, cols, num_tasks, action_dim=2, hidden=256):
             super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(state_dim, hidden),
+            self.rows = rows
+            self.cols = cols
+            self.num_tasks = num_tasks
+            
+            # CNN to "look" at the 2D grid
+            self.conv = nn.Sequential(
+                nn.Conv2d(1, 16, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.MaxPool2d(2),
+                nn.Conv2d(16, 32, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.MaxPool2d(2)
+            )
+            
+            # Calculate size after two poolings (grid dimensions divided by 4)
+            flattened_size = 32 * (rows // 4) * (cols // 4)
+            
+            # MLP combines the CNN features with the task_comm data
+            self.mlp = nn.Sequential(
+                nn.Linear(flattened_size + num_tasks, hidden),
                 nn.ReLU(),
                 nn.Linear(hidden, hidden),
                 nn.ReLU(),
                 nn.Linear(hidden, action_dim),
-                nn.Tanh()  # Action bounds [-1, 1] for continuous space
+                nn.Tanh()  # Action bounds [-1, 1]
             )
 
         def forward(self, state):
-            return self.net(state)
+            # 1. Split the flat state into the grid and the task_comm array
+            grid_size = self.rows * self.cols
+            grid_1d = state[:, :grid_size]
+            task_comm = state[:, grid_size:]
+            
+            # 2. Reshape the 1D grid into a 2D image: (Batch, Channels, Height, Width)
+            grid_2d = grid_1d.view(-1, 1, self.rows, self.cols)
+            
+            # 3. Extract spatial features using the CNN
+            cnn_features = self.conv(grid_2d)
+            cnn_features = torch.flatten(cnn_features, start_dim=1)
+            
+            # 4. Merge CNN features with the communication data
+            combined = torch.cat([cnn_features, task_comm], dim=1)
+            return self.mlp(combined)
 
     class Critic(nn.Module):
-        def __init__(self, state_dim, action_dim=2, hidden=256):
+        def __init__(self, rows, cols, num_tasks, action_dim=2, hidden=256):
             super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(state_dim + action_dim, hidden),
+            self.rows = rows
+            self.cols = cols
+            self.num_tasks = num_tasks
+            
+            self.conv = nn.Sequential(
+                nn.Conv2d(1, 16, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.MaxPool2d(2),
+                nn.Conv2d(16, 32, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.MaxPool2d(2)
+            )
+            
+            flattened_size = 32 * (rows // 4) * (cols // 4)
+            
+            # Critic includes the action_dim here!
+            self.mlp = nn.Sequential(
+                nn.Linear(flattened_size + num_tasks + action_dim, hidden),
                 nn.ReLU(),
                 nn.Linear(hidden, hidden),
                 nn.ReLU(),
@@ -303,8 +383,17 @@ if HAS_TORCH:
             )
 
         def forward(self, state, action):
-            x = torch.cat([state, action], dim=1)
-            return self.net(x)
+            grid_size = self.rows * self.cols
+            grid_1d = state[:, :grid_size]
+            task_comm = state[:, grid_size:]
+            
+            grid_2d = grid_1d.view(-1, 1, self.rows, self.cols)
+            cnn_features = self.conv(grid_2d)
+            cnn_features = torch.flatten(cnn_features, start_dim=1)
+            
+            # Critic combines CNN features, task comms, AND the action
+            combined = torch.cat([cnn_features, task_comm, action], dim=1)
+            return self.mlp(combined)
 
     class ReplayBuffer:
         def __init__(self, capacity=50000):
@@ -326,9 +415,27 @@ if HAS_TORCH:
         def __len__(self):
             return len(self.buffer)
 
+    class OUNoise:
+        """Ornstein-Uhlenbeck process for continuous action exploration."""
+        def __init__(self, size, mu=0.0, theta=0.15, sigma=0.2):
+            self.size = size
+            self.mu = mu
+            self.theta = theta
+            self.sigma = sigma
+            self.state = np.ones(self.size) * self.mu
+
+        def reset(self):
+            self.state = np.ones(self.size) * self.mu
+
+        def sample(self):
+            x = self.state
+            dx = self.theta * (self.mu - x) + self.sigma * np.random.randn(self.size)
+            self.state = x + dx
+            return self.state
+
     class DDPGAgent:
-        def __init__(self, state_dim, action_dim=2, lr_actor=1e-4, lr_critic=1e-3,
-                     gamma=0.99, tau=0.005, device=None):
+        def __init__(self, rows, cols, num_tasks, action_dim=2, lr_actor=2e-4, lr_critic=1e-3,
+                     gamma=0.98, tau=0.005, device=None):
             # PERF FIX: this agent previously never checked for a GPU, even
             # if one was available -- for a partitioned CNN workload the
             # state vector is total_cores + num_tasks (e.g. 4096+906=5002
@@ -339,13 +446,15 @@ if HAS_TORCH:
             self.device = torch.device(device)
 
             self.action_dim = action_dim
-            self.actor = Actor(state_dim, action_dim).to(self.device)
-            self.actor_target = Actor(state_dim, action_dim).to(self.device)
+            self.noise = OUNoise(action_dim)
+            
+            self.actor = Actor(rows, cols, num_tasks, action_dim).to(self.device)
+            self.actor_target = Actor(rows, cols, num_tasks, action_dim).to(self.device)
             self.actor_target.load_state_dict(self.actor.state_dict())
             self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr_actor)
 
-            self.critic = Critic(state_dim, action_dim).to(self.device)
-            self.critic_target = Critic(state_dim, action_dim).to(self.device)
+            self.critic = Critic(rows, cols, num_tasks, action_dim).to(self.device)
+            self.critic_target = Critic(rows, cols, num_tasks, action_dim).to(self.device)
             self.critic_target.load_state_dict(self.critic.state_dict())
             self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr_critic)
 
@@ -359,7 +468,7 @@ if HAS_TORCH:
                 action = self.actor(state).squeeze(0).cpu().numpy()
             self.actor.train()
             # Add exploration noise
-            action += noise_scale * np.random.randn(self.action_dim)
+            action += noise_scale * self.noise.sample()
             return np.clip(action, -1.0, 1.0)
 
         def train(self, replay_buffer, batch_size=64):
@@ -466,24 +575,24 @@ class MultiChipCoreMapper:
     def _occ_map(self) -> np.ndarray:
         # PAPER FIX (Sec 3.2, 'Representation of Core Placements'): occupied
         # cores are encoded by the INDEX of their assigned logic core, not a
-        # bare 0/1 flag -- otherwise the agent can never tell WHERE an
-        # already-placed predecessor task ended up, which is exactly the
-        # information needed to minimize communication cost to it.
+        # bare 0/1 flag
         m = np.zeros(self.total_rows * self.total_cols, dtype=np.float32)
-        for t, c in enumerate(self._placement):
-            if c >= 0:
-                m[c] = (t + 1) / self.num_tasks  # +1 so task 0 != "empty" (0.0)
+        valid = self._placement >= 0
+        if np.any(valid):
+            m[self._placement[valid]] = (np.arange(self.num_tasks)[valid] + 1) / self.num_tasks
 
         # PAPER FIX: expose BOTH directions of communication volume,
         # aggregated over the WHOLE upcoming batch of up to batch_z tasks
-        # (not just a single "current task"), since one action now assigns
-        # all of them at once.
         remaining = self.num_tasks - self._task_ptr
         n_batch = min(self.batch_z, remaining) if remaining > 0 else 0
-        task_comm = np.zeros(self.num_tasks, dtype=np.float32)
-        for k in range(n_batch):
-            idx = self._task_ptr + k
-            task_comm += self.env.task_graph[idx] + self.env.task_graph[:, idx]
+        
+        if n_batch > 0:
+            idxs = np.arange(self._task_ptr, self._task_ptr + n_batch)
+            # Vectorized computation instead of slow Python loop
+            task_comm = self.env.task_graph[idxs, :].sum(axis=0) + self.env.task_graph[:, idxs].sum(axis=1)
+            task_comm = np.asarray(task_comm).flatten().astype(np.float32)
+        else:
+            task_comm = np.zeros(self.num_tasks, dtype=np.float32)
 
         max_vol = task_comm.max()
         if max_vol > 0:
@@ -585,6 +694,11 @@ def run_ddpg(env: MultiChipEnvironment, n_episodes: int = 500, batch_size: int =
         print("[DDPG] torch not installed — falling back to random search")
         return run_random(env)
 
+    # --- Full Frame Timing Conversion ---
+    BYTES_PER_ACTIVATION = 2.0
+    NOC_BANDWIDTH_GBPS = 10.0
+    scale_factor = BYTES_PER_ACTIVATION / (NOC_BANDWIDTH_GBPS * 1e9)
+
     # CHECKPOINTING: if a checkpoint exists at load_checkpoint, resume from it
     # instead of starting fresh -- restores the trained networks, optimizer
     # state, best result so far, noise schedule position, and (importantly)
@@ -596,7 +710,7 @@ def run_ddpg(env: MultiChipEnvironment, n_episodes: int = 500, batch_size: int =
         checkpoint = torch.load(load_checkpoint, map_location="cpu", weights_only=False)
         baseline_latency = checkpoint["baseline_latency"]
         print(f"[DDPG] Resuming from episode {checkpoint['episode']}, "
-              f"Baseline B = {baseline_latency:.4f} (loaded, not recomputed)")
+              f"Baseline B = {baseline_latency * scale_factor:.6f}s (loaded, not recomputed)")
     else:
         if load_checkpoint is not None:
             print(f"[DDPG] --load_checkpoint {load_checkpoint} not found -- starting fresh "
@@ -607,7 +721,7 @@ def run_ddpg(env: MultiChipEnvironment, n_episodes: int = 500, batch_size: int =
         # since every training episode starts with mapper.reset() -> env.reset().
         print(f"[DDPG] Computing random-search baseline B ({baseline_trials} trials)...")
         baseline_latency = run_random(env, n_trials=baseline_trials)
-        print(f"[DDPG] Baseline B = {baseline_latency:.4f}")
+        print(f"[DDPG] Baseline B = {baseline_latency * scale_factor:.6f}s")
 
     topo  = env.topo
     rows  = topo.rows_per_chip * topo.num_chips_y
@@ -621,7 +735,7 @@ def run_ddpg(env: MultiChipEnvironment, n_episodes: int = 500, batch_size: int =
     print(f"[DDPG] Batched action: placing {batch_z} logic core(s) per step "
           f"(action_dim={action_dim})")
 
-    agent = DDPGAgent(state_dim=state_dim, action_dim=action_dim, device=device)
+    agent = DDPGAgent(rows=rows, cols=cols, num_tasks=env.num_tasks, action_dim=action_dim, device=device)
     print(f"[DDPG] Using device: {agent.device}"
           + (f" ({torch.get_num_threads()} CPU threads)" if agent.device.type == "cpu" else ""))
     replay_buffer = ReplayBuffer()
@@ -703,8 +817,8 @@ def run_ddpg(env: MultiChipEnvironment, n_episodes: int = 500, batch_size: int =
             per_ep = elapsed / max(1, ep - start_episode)
             eta_sec = per_ep * (n_episodes - ep)
             eta_str = str(timedelta(seconds=int(eta_sec)))
-            print(f"# of epochs: {ep:4d} | Current Cost: {final_cost:.2f} | "
-                  f"Best Cost: {best_cost:.2f} | {per_ep:.2f}s/ep | ETA: {eta_str}")
+            print(f"# of epochs: {ep:4d} | Current Cost: {final_cost * scale_factor:.6f}s | "
+                  f"Best Cost: {best_cost * scale_factor:.6f}s | {per_ep:.2f}s/ep | ETA: {eta_str}")
 
         if save_checkpoint is not None and ep % checkpoint_every == 0:
             _save_checkpoint(ep)
@@ -901,8 +1015,8 @@ def main():
 
     # 3. Run the algorithms
     if args.algo == "ddpg":
-        cost = run_ddpg(env, n_episodes=args.epochs, batch_z=args.batch_z,
-                         baseline_trials=args.baseline_trials,
+        cost = run_ddpg(env, n_episodes=args.epochs, batch_size=64,
+                         baseline_trials=args.baseline_trials, batch_z=args.batch_z,
                          train_every=args.train_every, device=args.device,
                          save_checkpoint=args.save_checkpoint,
                          load_checkpoint=args.load_checkpoint,
@@ -913,9 +1027,18 @@ def main():
         cost = run_random(env, n_trials=args.iters)
 
     bd = env.chip_breakdown()
-    print(f"\nFinal placement cost : {cost:.4f}")
-    print(f"  On-chip  comm cost : {bd['on_chip_cost']:.4f}")
-    print(f"  Off-chip comm cost : {bd['off_chip_cost']:.4f}")
+    
+    # --- Full Frame Timing Conversion ---
+    # Convert raw data volume into real-world seconds
+    # Assuming 2 bytes per activation (FP16) and a 10 GB/s NoC bandwidth
+    BYTES_PER_ACTIVATION = 2.0
+    NOC_BANDWIDTH_GBPS = 10.0
+    scale_factor = BYTES_PER_ACTIVATION / (NOC_BANDWIDTH_GBPS * 1e9)
+    
+    print(f"\n>> Full-frame approximation in seconds: arithmetic + byte-hop serialization; no contention or streaming schedule")
+    print(f"Final placement cost : {cost * scale_factor:.6f} seconds (Raw Volume: {cost:.0f})")
+    print(f"  On-chip  comm cost : {bd['on_chip_cost'] * scale_factor:.6f} seconds")
+    print(f"  Off-chip comm cost : {bd['off_chip_cost'] * scale_factor:.6f} seconds")
     print(f"  Chip placement     : {env.placement[:env.num_tasks]}")
 
 if __name__ == "__main__":
