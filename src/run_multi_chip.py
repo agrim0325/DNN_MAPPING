@@ -436,6 +436,62 @@ if HAS_TORCH:
             x = torch.cat([state, action], dim=1)
             return self.net(x)
 
+    class SpatialEncoder(nn.Module):
+        """Encode the policy's contiguous 2-D placement grid.
+
+        The mapper owns this grid representation and converts it to
+        chip-major physical IDs only when evaluating a placement. Keeping the
+        encoder on the policy grid prevents the coordinate mismatch in the
+        earlier CNN prototype.
+        """
+        def __init__(self, rows, cols):
+            super().__init__()
+            if rows < 4 or cols < 4:
+                raise ValueError("CNN agent requires a policy grid of at least 4x4")
+            self.rows, self.cols = rows, cols
+            self.net = nn.Sequential(
+                nn.Conv2d(1, 16, kernel_size=3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+                nn.Conv2d(16, 32, kernel_size=3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            )
+            with torch.no_grad():
+                self.feature_dim = int(self.net(torch.zeros(1, 1, rows, cols)).numel())
+
+        def forward(self, grid):
+            return torch.flatten(self.net(grid), start_dim=1)
+
+    class CNNActor(nn.Module):
+        """Spatial actor ported from the junior prototype, with current state semantics."""
+        def __init__(self, rows, cols, num_tasks, action_dim=2, hidden=256):
+            super().__init__()
+            self.rows, self.cols = rows, cols
+            self.encoder = SpatialEncoder(rows, cols)
+            self.head = nn.Sequential(
+                nn.Linear(self.encoder.feature_dim + num_tasks, hidden), nn.ReLU(),
+                nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, action_dim), nn.Tanh(),
+            )
+
+        def forward(self, state):
+            grid_size = self.rows * self.cols
+            grid = state[:, :grid_size].reshape(-1, 1, self.rows, self.cols)
+            return self.head(torch.cat([self.encoder(grid), state[:, grid_size:]], dim=1))
+
+    class CNNCritic(nn.Module):
+        """Spatial critic that combines grid features, task communication and action."""
+        def __init__(self, rows, cols, num_tasks, action_dim=2, hidden=256):
+            super().__init__()
+            self.rows, self.cols = rows, cols
+            self.encoder = SpatialEncoder(rows, cols)
+            self.head = nn.Sequential(
+                nn.Linear(self.encoder.feature_dim + num_tasks + action_dim, hidden), nn.ReLU(),
+                nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, 1),
+            )
+
+        def forward(self, state, action):
+            grid_size = self.rows * self.cols
+            grid = state[:, :grid_size].reshape(-1, 1, self.rows, self.cols)
+            features = torch.cat([self.encoder(grid), state[:, grid_size:], action], dim=1)
+            return self.head(features)
+
     class ReplayBuffer:
         def __init__(self, capacity=50000):
             self.buffer = []
@@ -458,7 +514,8 @@ if HAS_TORCH:
 
     class DDPGAgent:
         def __init__(self, state_dim, action_dim=2, lr_actor=2e-4, lr_critic=1e-3,
-                     gamma=0.98, tau=0.005, device=None):
+                     gamma=0.98, tau=0.005, device=None, agent_arch="mlp",
+                     rows=None, cols=None, num_tasks=None):
             # PERF FIX: this agent previously never checked for a GPU, even
             # if one was available -- for a partitioned CNN workload the
             # state vector is total_cores + num_tasks (e.g. 4096+906=5002
@@ -469,15 +526,27 @@ if HAS_TORCH:
             if device is None:
                 device = "cuda" if torch.cuda.is_available() else "cpu"
             self.device = torch.device(device)
+            if agent_arch not in ("mlp", "cnn"):
+                raise ValueError(f"Unknown agent architecture: {agent_arch}")
+            self.agent_arch = agent_arch
 
             self.action_dim = action_dim
-            self.actor = Actor(state_dim, action_dim).to(self.device)
-            self.actor_target = Actor(state_dim, action_dim).to(self.device)
+            if agent_arch == "cnn":
+                if rows is None or cols is None or num_tasks is None:
+                    raise ValueError("CNN agent requires rows, cols and num_tasks")
+                actor_cls, critic_cls = CNNActor, CNNCritic
+                actor_args = (rows, cols, num_tasks, action_dim)
+                critic_args = (rows, cols, num_tasks, action_dim)
+            else:
+                actor_cls, critic_cls = Actor, Critic
+                actor_args, critic_args = (state_dim, action_dim), (state_dim, action_dim)
+            self.actor = actor_cls(*actor_args).to(self.device)
+            self.actor_target = actor_cls(*actor_args).to(self.device)
             self.actor_target.load_state_dict(self.actor.state_dict())
             self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr_actor)
 
-            self.critic = Critic(state_dim, action_dim).to(self.device)
-            self.critic_target = Critic(state_dim, action_dim).to(self.device)
+            self.critic = critic_cls(*critic_args).to(self.device)
+            self.critic_target = critic_cls(*critic_args).to(self.device)
             self.critic_target.load_state_dict(self.critic.state_dict())
             self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr_critic)
 
@@ -746,7 +815,7 @@ def run_ddpg(env: MultiChipEnvironment, n_episodes: int = 500, batch_size: int =
              baseline_trials: int = 1000, batch_z: int = 3, train_every: int = 5,
              device: str = None, save_checkpoint: str = None, load_checkpoint: str = None,
              checkpoint_every: int = 100, diagnostics_path: str = None,
-             run_metadata: dict = None) -> float:
+             run_metadata: dict = None, agent_arch: str = "mlp") -> float:
     if not HAS_TORCH:
         raise RuntimeError("DDPG requires PyTorch; refusing a random-search fallback")
 
@@ -754,7 +823,7 @@ def run_ddpg(env: MultiChipEnvironment, n_episodes: int = 500, batch_size: int =
     signature.update(np.ascontiguousarray(env.task_graph).tobytes())
     signature.update(np.ascontiguousarray(env.compute_latency).tobytes())
     signature.update(repr((env.topo, env.topo.on_chip_latency, env.topo.off_chip_latency,
-                           batch_z, env.timing_units, "chip-major-v2-ou")).encode())
+                           batch_z, env.timing_units, agent_arch, "chip-major-v2-ou")).encode())
     fingerprint = signature.hexdigest()
     # Reject old or incompatible checkpoints, including changed objective units.
     # instead of starting fresh -- restores the trained networks, optimizer
@@ -795,7 +864,9 @@ def run_ddpg(env: MultiChipEnvironment, n_episodes: int = 500, batch_size: int =
     print(f"[DDPG] Batched action: placing {batch_z} logic core(s) per step "
           f"(action_dim={action_dim})")
 
-    agent = DDPGAgent(state_dim=state_dim, action_dim=action_dim, device=device)
+    agent = DDPGAgent(state_dim=state_dim, action_dim=action_dim, device=device,
+                      agent_arch=agent_arch, rows=rows, cols=cols, num_tasks=env.num_tasks)
+    print(f"[DDPG] Agent architecture: {agent_arch}")
     print(f"[DDPG] Using device: {agent.device}"
           + (f" ({torch.get_num_threads()} CPU threads)" if agent.device.type == "cpu" else ""))
     replay_buffer = ReplayBuffer()
@@ -946,7 +1017,7 @@ def run_ddpg(env: MultiChipEnvironment, n_episodes: int = 500, batch_size: int =
     if diagnostics_stream is not None:
         diagnostics_stream.close()
     if run_metadata is not None:
-        run_metadata.update({"baseline_cost": baseline_latency, "start_episode": start_episode,
+        run_metadata.update({"agent_arch": agent_arch, "baseline_cost": baseline_latency, "start_episode": start_episode,
                              "end_episode": n_episodes, "global_steps": global_step,
                              "final_noise_scale": noise_scale, "diagnostics_path": diagnostics_path})
 
@@ -1132,6 +1203,8 @@ def main():
     parser.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"],
                          help="Force a specific device for DDPG. Default: auto-detect "
                               "CUDA if available, else CPU.")
+    parser.add_argument("--agent_arch", choices=["mlp", "cnn"], default="mlp",
+                        help="DDPG actor/critic architecture. cnn encodes the policy's 2-D placement grid; mlp is the historical default.")
     parser.add_argument("--compute_ops", type=str, default=None,
                          help="Optional .npy file containing MAC operations per task; "
                               "converted with Table 1's 128 MACs/core at 400 MHz.")
@@ -1269,7 +1342,8 @@ def main():
                          save_checkpoint=args.save_checkpoint,
                          load_checkpoint=args.load_checkpoint,
                          checkpoint_every=args.checkpoint_every,
-                         diagnostics_path=args.diagnostics, run_metadata=ddpg_metadata)
+                         diagnostics_path=args.diagnostics, run_metadata=ddpg_metadata,
+                         agent_arch=args.agent_arch)
     elif args.algo == "sa":
         cost = run_sa(env, n_iter=args.iters)
     else:
@@ -1292,7 +1366,8 @@ def main():
                        "torch_version": torch.__version__ if HAS_TORCH else None,
                        "cuda_available": HAS_TORCH and torch.cuda.is_available(),
                        "ddpg_metadata": ddpg_metadata if args.algo == "ddpg" else None,
-                       "limitations": ["MLP policy, not paper CNN", "no shared-link contention",
+                       "limitations": ["CNN agent is an experimental spatial encoder, not a validated paper architecture",
+                           "no shared-link contention",
                            "no block-streaming schedule", "uniform channel partitioning",
                            "full_frame excludes residual/concat timing", "replay not persisted"]},
                       stream, indent=2)

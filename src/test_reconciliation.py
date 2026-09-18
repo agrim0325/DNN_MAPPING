@@ -120,6 +120,28 @@ class WorkloadTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "CUDA"):
                 rm.DDPGAgent(8, device="cuda")
 
+    def test_cnn_agent_spatial_state_and_update(self):
+        import torch
+        torch.set_num_threads(2)
+        rows, cols, tasks, action_dim = 8, 8, 5, 4
+        state_dim = rows * cols + tasks
+        agent = rm.DDPGAgent(state_dim, action_dim, device="cpu", agent_arch="cnn",
+                             rows=rows, cols=cols, num_tasks=tasks)
+        state = np.zeros(state_dim, dtype=np.float32)
+        state[0] = 0.2
+        action = agent.select_action(state, explore=False)
+        self.assertEqual(action.shape, (action_dim,))
+        replay = rm.ReplayBuffer(64)
+        for _ in range(64):
+            replay.add(state, action, 0.2, state, True)
+        before = next(agent.actor.parameters()).detach().clone()
+        loss = agent.train(replay)
+        self.assertIsNotNone(loss)
+        self.assertIn("actor_loss", loss)
+        self.assertFalse(torch.equal(before, next(agent.actor.parameters()).detach()))
+        with self.assertRaisesRegex(ValueError, "at least 4x4"):
+            rm.DDPGAgent(9, 2, device="cpu", agent_arch="cnn", rows=3, cols=3, num_tasks=0)
+
 
 if __name__ == "__main__":
     unittest.main()

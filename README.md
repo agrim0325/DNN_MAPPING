@@ -283,7 +283,7 @@ across five reproducible seeds, run this on the GPU host:
 
 ```bash
 python src/run_multiseed_experiment.py \
-  --device cuda --seeds 0,1,2,3,4 --epochs 1000 --baseline_trials 1000 \
+  --device cuda --agent_arch cnn --seeds 0,1,2,3,4 --epochs 1000 --baseline_trials 1000 \
   --model alexnet --channels_per_partition 512 \
   --output_dir runs/alexnet-five-seed
 ```
@@ -294,6 +294,12 @@ policy costs, reward, OU noise, collision repairs, action distribution, and
 actor/critic losses. Each method receives 1,000 complete-placement evaluations;
 DDPG's 1,000 baseline trials are separately reported because they normalize its
 sparse reward and are not part of that matched comparison.
+
+`--agent_arch mlp` is the default. `--agent_arch cnn` applies two convolution
+and pooling stages to the 2-D policy-grid state, then combines those spatial
+features with the task-communication vector. It is an experimental spatial
+encoder; use the matched multi-seed runner to compare it with the MLP before
+claiming an improvement.
 
 1. Reconstruct and validate block-streaming stages and communication contention with explicit assumptions.
 2. Implement compute-aware partitioning and buffer-capacity constraints; the paper's refinement formula is unspecified.

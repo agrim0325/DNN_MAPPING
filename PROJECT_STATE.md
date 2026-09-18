@@ -178,6 +178,13 @@ deterministic policy costs, reward, OU scale, collision repairs, action
 statistics, and actor/critic losses. This records evidence; it does not change
 the sparse reward or make the MLP DDPG policy equivalent to the paper's CNN.
 
+The current DDPG path also has an opt-in `--agent_arch cnn` spatial actor and
+critic. It encodes the mapper's contiguous policy grid, retains the current
+chip-major conversion at placement evaluation, and keeps the task-communication
+vector as a separate input. The architecture was adapted from a junior's
+prototype but not its older extractor, physical-ID mapping, or timing model.
+It is an experimental comparison condition, not evidence of paper reproduction.
+
 ## Next priorities
 
 CPU validation completed on 2026-09-11 with Torch 2.14.0+cpu: both maintained

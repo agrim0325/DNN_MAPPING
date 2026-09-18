@@ -41,6 +41,7 @@ def main():
     parser.add_argument("--batch_z", type=positive, default=3)
     parser.add_argument("--train_every", type=positive, default=1)
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
+    parser.add_argument("--agent_arch", choices=["mlp", "cnn"], default="mlp")
     args = parser.parse_args()
     try:
         seeds = [int(part.strip()) for part in args.seeds.split(",") if part.strip()]
@@ -68,6 +69,7 @@ def main():
                 command.extend(["--device", args.device, "--epochs", str(args.epochs),
                                 "--baseline_trials", str(args.baseline_trials),
                                 "--batch_z", str(args.batch_z), "--train_every", str(args.train_every),
+                                "--agent_arch", args.agent_arch,
                                 "--diagnostics", str(output_dir / f"{stem}.jsonl"),
                                 "--save_checkpoint", str(output_dir / f"{stem}.pt")])
             else:
