@@ -633,7 +633,8 @@ if HAS_TORCH:
 # ---------------------------------------------------------------------------
 
 class MultiChipCoreMapper:
-    def __init__(self, env: MultiChipEnvironment, baseline_latency: float = None, batch_z: int = 3):
+    def __init__(self, env: MultiChipEnvironment, baseline_latency: float = None, batch_z: int = 3,
+                 reward_mode: str = "sparse", shaping_gamma: float = 0.98):
         """
         Args:
             baseline_latency: B in the paper's reward r_t = sqrt(B) - sqrt(L(P))
@@ -659,6 +660,11 @@ class MultiChipCoreMapper:
         self._occupied  = set()
         self._task_ptr  = 0
         self.collision_repairs = 0
+        if reward_mode not in ("sparse", "potential"):
+            raise ValueError("reward_mode must be sparse or potential")
+        self.reward_mode = reward_mode
+        self.shaping_gamma = shaping_gamma
+        self._potential = 0.0
         self.baseline_latency = baseline_latency
         if baseline_latency is None:
             print("[WARN] MultiChipCoreMapper created without baseline_latency -- "
@@ -670,6 +676,7 @@ class MultiChipCoreMapper:
         self._occupied.clear()
         self._task_ptr = 0
         self.collision_repairs = 0
+        self._potential = 0.0
         self.env.reset()
         return self._occ_map()
 
@@ -773,11 +780,26 @@ class MultiChipCoreMapper:
         # reward, r_t = sqrt(B) - sqrt(L(P)) (Algorithm 1, line 11), where B
         # is the fixed random-search baseline and L(P) is the pipeline
         # bottleneck latency (env.evaluate(), Eq. 4).
-        if not done:
+        if not done and self.reward_mode == "sparse":
             return 0.0, done, "", 0.0
 
         self.env.place(self.get_placement())
         final_cost = self.env.evaluate()
+        if self.reward_mode == "potential":
+            # Potential-based shaping F(s,s') = gamma*Phi(s') - Phi(s),
+            # with Phi(terminal)=0. Across a fixed episode the discounted
+            # shaping terms telescope to zero, so the sparse objective is
+            # preserved while the critic receives intermediate feedback.
+            next_potential = 0.0 if done else -math.sqrt(max(final_cost, 0.0))
+            base_reward = 0.0
+            if done:
+                base_reward = (math.sqrt(max(self.baseline_latency, 0.0)) -
+                               math.sqrt(max(final_cost, 0.0))) if self.baseline_latency is not None \
+                              else -math.sqrt(max(final_cost, 0.0))
+            step_reward = base_reward + self.shaping_gamma * next_potential - self._potential
+            self._potential = next_potential
+            return step_reward, done, self._render() if done else "", final_cost if done else 0.0
+
         grid = self._render()
 
         if self.baseline_latency is not None:
@@ -815,7 +837,8 @@ def run_ddpg(env: MultiChipEnvironment, n_episodes: int = 500, batch_size: int =
              baseline_trials: int = 1000, batch_z: int = 3, train_every: int = 5,
              device: str = None, save_checkpoint: str = None, load_checkpoint: str = None,
              checkpoint_every: int = 100, diagnostics_path: str = None,
-             run_metadata: dict = None, agent_arch: str = "mlp") -> float:
+             run_metadata: dict = None, agent_arch: str = "mlp",
+             reward_mode: str = "sparse") -> float:
     if not HAS_TORCH:
         raise RuntimeError("DDPG requires PyTorch; refusing a random-search fallback")
 
@@ -823,7 +846,8 @@ def run_ddpg(env: MultiChipEnvironment, n_episodes: int = 500, batch_size: int =
     signature.update(np.ascontiguousarray(env.task_graph).tobytes())
     signature.update(np.ascontiguousarray(env.compute_latency).tobytes())
     signature.update(repr((env.topo, env.topo.on_chip_latency, env.topo.off_chip_latency,
-                           batch_z, env.timing_units, agent_arch, "chip-major-v2-ou")).encode())
+                           batch_z, env.timing_units, agent_arch, reward_mode,
+                           "chip-major-v2-ou")).encode())
     fingerprint = signature.hexdigest()
     # Reject old or incompatible checkpoints, including changed objective units.
     # instead of starting fresh -- restores the trained networks, optimizer
@@ -870,7 +894,8 @@ def run_ddpg(env: MultiChipEnvironment, n_episodes: int = 500, batch_size: int =
     print(f"[DDPG] Using device: {agent.device}"
           + (f" ({torch.get_num_threads()} CPU threads)" if agent.device.type == "cpu" else ""))
     replay_buffer = ReplayBuffer()
-    mapper = MultiChipCoreMapper(env, baseline_latency=baseline_latency, batch_z=batch_z)
+    mapper = MultiChipCoreMapper(env, baseline_latency=baseline_latency, batch_z=batch_z,
+                                 reward_mode=reward_mode, shaping_gamma=agent.gamma)
     diagnostics_stream = None
     if diagnostics_path is not None:
         parent = os.path.dirname(diagnostics_path)
@@ -943,11 +968,17 @@ def run_ddpg(env: MultiChipEnvironment, n_episodes: int = 500, batch_size: int =
         agent.ou_state.fill(0)
         done = False
         actions, losses = [], []
+        episode_return = 0.0
+        episode_discounted_return = 0.0
+        episode_step = 0
 
         while not done:
             action = agent.select_action(state, noise_scale=noise_scale)
             actions.append(action.copy())
             reward, done, grid, final_cost = mapper.step(action)
+            episode_return += reward
+            episode_discounted_return += (agent.gamma ** episode_step) * reward
+            episode_step += 1
             next_state = mapper._occ_map()
 
             replay_buffer.add(state, action, reward, next_state, done)
@@ -970,7 +1001,8 @@ def run_ddpg(env: MultiChipEnvironment, n_episodes: int = 500, batch_size: int =
             # separate rollout: it answers whether the trained policy itself
             # is useful, rather than whether a lucky noisy action was useful.
             evaluation_mapper = MultiChipCoreMapper(env, baseline_latency=baseline_latency,
-                                                     batch_z=batch_z)
+                                                     batch_z=batch_z, reward_mode=reward_mode,
+                                                     shaping_gamma=agent.gamma)
             evaluation_state = evaluation_mapper.reset()
             evaluation_done = False
             while not evaluation_done:
@@ -986,6 +1018,8 @@ def run_ddpg(env: MultiChipEnvironment, n_episodes: int = 500, batch_size: int =
                 "best_cost": best_cost,
                 "deterministic_cost": deterministic_cost,
                 "reward": reward,
+                "episode_return": episode_return,
+                "episode_discounted_return": episode_discounted_return,
                 "noise_scale": noise_scale,
                 "collision_repairs": mapper.collision_repairs,
                 "action_mean": float(action_values.mean()) if len(action_values) else None,
@@ -1017,7 +1051,8 @@ def run_ddpg(env: MultiChipEnvironment, n_episodes: int = 500, batch_size: int =
     if diagnostics_stream is not None:
         diagnostics_stream.close()
     if run_metadata is not None:
-        run_metadata.update({"agent_arch": agent_arch, "baseline_cost": baseline_latency, "start_episode": start_episode,
+        run_metadata.update({"agent_arch": agent_arch, "reward_mode": reward_mode,
+                             "baseline_cost": baseline_latency, "start_episode": start_episode,
                              "end_episode": n_episodes, "global_steps": global_step,
                              "final_noise_scale": noise_scale, "diagnostics_path": diagnostics_path})
 
@@ -1205,6 +1240,8 @@ def main():
                               "CUDA if available, else CPU.")
     parser.add_argument("--agent_arch", choices=["mlp", "cnn"], default="mlp",
                         help="DDPG actor/critic architecture. cnn encodes the policy's 2-D placement grid; mlp is the historical default.")
+    parser.add_argument("--reward_mode", choices=["sparse", "potential"], default="sparse",
+                        help="DDPG reward: paper-style sparse terminal reward, or opt-in potential-based shaping with the same fixed-horizon discounted objective.")
     parser.add_argument("--compute_ops", type=str, default=None,
                          help="Optional .npy file containing MAC operations per task; "
                               "converted with Table 1's 128 MACs/core at 400 MHz.")
@@ -1343,7 +1380,7 @@ def main():
                          load_checkpoint=args.load_checkpoint,
                          checkpoint_every=args.checkpoint_every,
                          diagnostics_path=args.diagnostics, run_metadata=ddpg_metadata,
-                         agent_arch=args.agent_arch)
+                         agent_arch=args.agent_arch, reward_mode=args.reward_mode)
     elif args.algo == "sa":
         cost = run_sa(env, n_iter=args.iters)
     else:

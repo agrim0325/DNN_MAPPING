@@ -301,6 +301,25 @@ features with the task-communication vector. It is an experimental spatial
 encoder; use the matched multi-seed runner to compare it with the MLP before
 claiming an improvement.
 
+Paper-mode reward remains `--reward_mode sparse`. The opt-in
+`--reward_mode potential` adds discounted potential-based feedback from partial
+placements; its shaping terms telescope to zero over the fixed episode horizon.
+Treat it as an improvement experiment and report it separately from sparse
+paper-mode runs.
+
+After completing MLP and CNN experiment directories, diagnose convergence with:
+
+```bash
+python src/analyze_multiseed.py \
+  runs/alexnet-mlp-five-seed runs/alexnet-cnn-five-seed \
+  --output runs/alexnet-agent-comparison.json
+```
+
+The analyzer reports the deterministic policy's gap from the best noisy sample,
+the first best epoch, tail cost variation, collision repairs, losses, and
+aggregate DDPG reductions relative to random search and SA. The planned order
+for model-fidelity work is recorded in `NEXT_STEPS.md`.
+
 1. Reconstruct and validate block-streaming stages and communication contention with explicit assumptions.
 2. Implement compute-aware partitioning and buffer-capacity constraints; the paper's refinement formula is unspecified.
 3. Implement and validate merge arithmetic and separate CONV/FC placement regions.
@@ -322,10 +341,12 @@ src/
   test_reconciliation.py     # Reconciliation regression suite
   validate_device.py         # Bounded CPU/CUDA validation and component timings
   run_multiseed_experiment.py # Reproducible DDPG/RS/SA multi-seed comparison
+  analyze_multiseed.py        # Learning/convergence analysis across experiment directories
   run_multi_chip_fast.py     # Historical alternative; not reconciled or validated
   agent/, env/, runner/      # Original single-chip implementation
 RECONCILIATION.md             # Detailed assumptions and reconciliation history
 PROJECT_STATE.md              # Corrected progress, evidence and next steps
+NEXT_STEPS.md                 # Ordered paper-reproduction and improvement plan
 requirements.txt              # Historical dependency list, not current multi-chip setup
 ~~~
 

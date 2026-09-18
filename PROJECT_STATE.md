@@ -185,6 +185,10 @@ vector as a separate input. The architecture was adapted from a junior's
 prototype but not its older extractor, physical-ID mapping, or timing model.
 It is an experimental comparison condition, not evidence of paper reproduction.
 
+Local follow-on work adds an opt-in potential-based reward mode while retaining
+the sparse terminal reward as default. Potential shaping is an improvement
+experiment for credit assignment and must not be labeled as the paper's reward.
+
 ## Next priorities
 
 CPU validation completed on 2026-09-11 with Torch 2.14.0+cpu: both maintained

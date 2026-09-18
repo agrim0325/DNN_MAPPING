@@ -61,6 +61,22 @@ class TimingTests(unittest.TestCase):
         self.assertEqual(obj.calls, 1001)  # initial plus budgeted neighbors
         self.assertEqual(result, 0)
 
+    def test_potential_shaping_preserves_discounted_return(self):
+        gamma = 0.98
+        graph = np.array([[0, 1, 0], [0, 0, 1], [0, 0, 0]], dtype=np.float32)
+        actions = [np.array([-1.0, -1.0]), np.array([1.0, -1.0]),
+                   np.array([1.0, 1.0])]
+        returns = []
+        for mode in ("sparse", "potential"):
+            env = MultiChipEnvironment(1, 1, 2, 2, task_graph=graph, num_tasks=3)
+            mapper = rm.MultiChipCoreMapper(env, baseline_latency=10.0, batch_z=1,
+                                             reward_mode=mode, shaping_gamma=gamma)
+            mapper.reset()
+            rewards = [mapper.step(action)[0] for action in actions]
+            returns.append(sum((gamma ** index) * reward
+                               for index, reward in enumerate(rewards)))
+        self.assertAlmostEqual(returns[0], returns[1], places=10)
+
 
 @unittest.skipUnless(rm.HAS_TORCH, "PyTorch required")
 class WorkloadTests(unittest.TestCase):
