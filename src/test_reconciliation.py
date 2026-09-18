@@ -141,20 +141,29 @@ class WorkloadTests(unittest.TestCase):
         torch.set_num_threads(2)
         rows, cols, tasks, action_dim = 8, 8, 5, 4
         state_dim = rows * cols + tasks
-        agent = rm.DDPGAgent(state_dim, action_dim, device="cpu", agent_arch="cnn",
-                             rows=rows, cols=cols, num_tasks=tasks)
         state = np.zeros(state_dim, dtype=np.float32)
         state[0] = 0.2
-        action = agent.select_action(state, explore=False)
-        self.assertEqual(action.shape, (action_dim,))
-        replay = rm.ReplayBuffer(64)
-        for _ in range(64):
-            replay.add(state, action, 0.2, state, True)
-        before = next(agent.actor.parameters()).detach().clone()
-        loss = agent.train(replay)
-        self.assertIsNotNone(loss)
-        self.assertIn("actor_loss", loss)
-        self.assertFalse(torch.equal(before, next(agent.actor.parameters()).detach()))
+        for architecture in ("cnn", "paper_cnn"):
+            agent = rm.DDPGAgent(state_dim, action_dim, device="cpu", agent_arch=architecture,
+                                 rows=rows, cols=cols, num_tasks=tasks)
+            action = agent.select_action(state, explore=False)
+            self.assertEqual(action.shape, (action_dim,))
+            replay = rm.ReplayBuffer(64)
+            for _ in range(64):
+                replay.add(state, action, 0.2, state, True)
+            before = [parameter.detach().clone() for parameter in agent.actor.parameters()]
+            loss = agent.train(replay)
+            self.assertIsNotNone(loss)
+            self.assertIn("actor_loss", loss)
+            self.assertTrue(any(not torch.equal(old, new.detach())
+                                for old, new in zip(before, agent.actor.parameters())))
+        paper = rm.DDPGAgent(state_dim, action_dim, device="cpu", agent_arch="paper_cnn",
+                             rows=rows, cols=cols, num_tasks=tasks)
+        self.assertEqual(paper.actor.encoder.net[0].out_channels, 32)
+        self.assertEqual(paper.actor.encoder.net[4].out_channels, 64)
+        self.assertEqual(paper.actor.fc1.out_features, 600)
+        self.assertEqual(paper.actor.fc2.out_features, 300)
+        self.assertEqual(paper.critic.fc2.in_features, 600 + action_dim)
         with self.assertRaisesRegex(ValueError, "at least 4x4"):
             rm.DDPGAgent(9, 2, device="cpu", agent_arch="cnn", rows=3, cols=3, num_tasks=0)
 

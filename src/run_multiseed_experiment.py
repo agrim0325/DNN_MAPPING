@@ -41,7 +41,7 @@ def main():
     parser.add_argument("--batch_z", type=positive, default=3)
     parser.add_argument("--train_every", type=positive, default=1)
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
-    parser.add_argument("--agent_arch", choices=["mlp", "cnn"], default="mlp")
+    parser.add_argument("--agent_arch", choices=["mlp", "cnn", "paper_cnn"], default="mlp")
     parser.add_argument("--reward_mode", choices=["sparse", "potential"], default="sparse")
     args = parser.parse_args()
     try:

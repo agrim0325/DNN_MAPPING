@@ -283,7 +283,7 @@ across five reproducible seeds, run this on the GPU host:
 
 ```bash
 python src/run_multiseed_experiment.py \
-  --device cuda --agent_arch cnn --seeds 0,1,2,3,4 --epochs 1000 --baseline_trials 1000 \
+  --device cuda --agent_arch paper_cnn --seeds 0,1,2,3,4 --epochs 1000 --baseline_trials 1000 \
   --model alexnet --channels_per_partition 512 \
   --output_dir runs/alexnet-five-seed
 ```
@@ -295,11 +295,13 @@ actor/critic losses. Each method receives 1,000 complete-placement evaluations;
 DDPG's 1,000 baseline trials are separately reported because they normalize its
 sparse reward and are not part of that matched comparison.
 
-`--agent_arch mlp` is the default. `--agent_arch cnn` applies two convolution
-and pooling stages to the 2-D policy-grid state, then combines those spatial
-features with the task-communication vector. It is an experimental spatial
-encoder; use the matched multi-seed runner to compare it with the MLP before
-claiming an improvement.
+`--agent_arch mlp` is the default. `--agent_arch cnn` preserves the junior-derived
+spatial encoder that combines grid features with the task-communication vector.
+`--agent_arch paper_cnn` follows Figure 9: 3x3 CONV-32, pool/LRN, 3x3 CONV-64,
+pool/LRN, FC-600/BN, FC-300/BN and the actor output; the critic merges the action
+after FC-600. The paper does not state convolution padding or LRN parameters, so
+same-padding and PyTorch's conventional size-5 LRN are documented assumptions.
+Run matched seeds before claiming an improvement.
 
 Paper-mode reward remains `--reward_mode sparse`. The opt-in
 `--reward_mode potential` adds discounted potential-based feedback from partial

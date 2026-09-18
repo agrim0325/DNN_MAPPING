@@ -185,6 +185,13 @@ vector as a separate input. The architecture was adapted from a junior's
 prototype but not its older extractor, physical-ID mapping, or timing model.
 It is an experimental comparison condition, not evidence of paper reproduction.
 
+Local follow-on work adds `--agent_arch paper_cnn` from Figure 9: CONV-32 and
+CONV-64 with pooling/LRN, FC-600 and FC-300 with batch normalization, actor
+FC-2z, and critic action merging after FC-600. It consumes only the paper's 2-D
+placement matrix; the junior-derived `cnn` retains the extra communication
+vector. Convolution padding and LRN parameters are not specified by the paper
+and remain explicit assumptions.
+
 Local follow-on work adds an opt-in potential-based reward mode while retaining
 the sparse terminal reward as default. Potential shaping is an improvement
 experiment for credit assignment and must not be labeled as the paper's reward.

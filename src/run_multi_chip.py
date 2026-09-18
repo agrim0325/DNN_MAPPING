@@ -492,6 +492,63 @@ if HAS_TORCH:
             features = torch.cat([self.encoder(grid), state[:, grid_size:], action], dim=1)
             return self.head(features)
 
+    class PaperSpatialEncoder(nn.Module):
+        """Figure 9 spatial stack; padding and LRN parameters are assumptions."""
+        def __init__(self, rows, cols):
+            super().__init__()
+            if rows < 4 or cols < 4:
+                raise ValueError("Paper CNN agent requires a policy grid of at least 4x4")
+            self.rows, self.cols = rows, cols
+            self.net = nn.Sequential(
+                nn.Conv2d(1, 32, kernel_size=3, padding=1), nn.ReLU(),
+                nn.MaxPool2d(2), nn.LocalResponseNorm(5),
+                nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.ReLU(),
+                nn.MaxPool2d(2), nn.LocalResponseNorm(5),
+            )
+            with torch.no_grad():
+                self.feature_dim = int(self.net(torch.zeros(1, 1, rows, cols)).numel())
+
+        def forward(self, grid):
+            return torch.flatten(self.net(grid), start_dim=1)
+
+    class PaperCNNActor(nn.Module):
+        """Actor from paper Figure 9: CONV32/64, FC600/300, FC(2z)."""
+        def __init__(self, rows, cols, num_tasks, action_dim=2):
+            super().__init__()
+            self.rows, self.cols = rows, cols
+            self.encoder = PaperSpatialEncoder(rows, cols)
+            self.fc1 = nn.Linear(self.encoder.feature_dim, 600)
+            self.bn1 = nn.BatchNorm1d(600)
+            self.fc2 = nn.Linear(600, 300)
+            self.bn2 = nn.BatchNorm1d(300)
+            self.output = nn.Linear(300, action_dim)
+
+        def forward(self, state):
+            grid_size = self.rows * self.cols
+            grid = state[:, :grid_size].reshape(-1, 1, self.rows, self.cols)
+            x = F.relu(self.bn1(self.fc1(self.encoder(grid))))
+            x = F.relu(self.bn2(self.fc2(x)))
+            return torch.tanh(self.output(x))
+
+    class PaperCNNCritic(nn.Module):
+        """Critic from Figure 9; action merges after FC600 as stated in text."""
+        def __init__(self, rows, cols, num_tasks, action_dim=2):
+            super().__init__()
+            self.rows, self.cols = rows, cols
+            self.encoder = PaperSpatialEncoder(rows, cols)
+            self.fc1 = nn.Linear(self.encoder.feature_dim, 600)
+            self.bn1 = nn.BatchNorm1d(600)
+            self.fc2 = nn.Linear(600 + action_dim, 300)
+            self.bn2 = nn.BatchNorm1d(300)
+            self.output = nn.Linear(300, 1)
+
+        def forward(self, state, action):
+            grid_size = self.rows * self.cols
+            grid = state[:, :grid_size].reshape(-1, 1, self.rows, self.cols)
+            x = F.relu(self.bn1(self.fc1(self.encoder(grid))))
+            x = F.relu(self.bn2(self.fc2(torch.cat([x, action], dim=1))))
+            return self.output(x)
+
     class ReplayBuffer:
         def __init__(self, capacity=50000):
             self.buffer = []
@@ -526,15 +583,16 @@ if HAS_TORCH:
             if device is None:
                 device = "cuda" if torch.cuda.is_available() else "cpu"
             self.device = torch.device(device)
-            if agent_arch not in ("mlp", "cnn"):
+            if agent_arch not in ("mlp", "cnn", "paper_cnn"):
                 raise ValueError(f"Unknown agent architecture: {agent_arch}")
             self.agent_arch = agent_arch
 
             self.action_dim = action_dim
-            if agent_arch == "cnn":
+            if agent_arch in ("cnn", "paper_cnn"):
                 if rows is None or cols is None or num_tasks is None:
                     raise ValueError("CNN agent requires rows, cols and num_tasks")
-                actor_cls, critic_cls = CNNActor, CNNCritic
+                actor_cls, critic_cls = ((PaperCNNActor, PaperCNNCritic)
+                                         if agent_arch == "paper_cnn" else (CNNActor, CNNCritic))
                 actor_args = (rows, cols, num_tasks, action_dim)
                 critic_args = (rows, cols, num_tasks, action_dim)
             else:
@@ -1238,8 +1296,8 @@ def main():
     parser.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"],
                          help="Force a specific device for DDPG. Default: auto-detect "
                               "CUDA if available, else CPU.")
-    parser.add_argument("--agent_arch", choices=["mlp", "cnn"], default="mlp",
-                        help="DDPG actor/critic architecture. cnn encodes the policy's 2-D placement grid; mlp is the historical default.")
+    parser.add_argument("--agent_arch", choices=["mlp", "cnn", "paper_cnn"], default="mlp",
+                        help="DDPG architecture: historical MLP, junior-derived augmented CNN, or Figure-9 paper CNN.")
     parser.add_argument("--reward_mode", choices=["sparse", "potential"], default="sparse",
                         help="DDPG reward: paper-style sparse terminal reward, or opt-in potential-based shaping with the same fixed-horizon discounted objective.")
     parser.add_argument("--compute_ops", type=str, default=None,

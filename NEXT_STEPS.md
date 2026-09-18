@@ -14,9 +14,10 @@ changes have been reviewed and integrated.
    terminal reward as the default. Add potential-based shaping as an opt-in
    condition whose discounted shaping return telescopes to zero, preserving
    the original objective for a fixed episode horizon.
-3. **Validate architecture claims.** Compare the spatial CNN implementation
-   with the actor/critic diagram and dimensions in the paper. Record every
-   unspecified layer or hyperparameter as an assumption.
+3. **Validate architecture claims.** A Figure-9 `paper_cnn` implementation is
+   now present with the documented CONV-32/64, FC-600/300, LRN, BN and critic
+   action merge. Validate it experimentally and retain padding/LRN parameters
+   as assumptions because the paper does not specify them.
 4. **Reconstruct the timing model.** Specify block size, pipeline stages,
    transformation work, communication startup, bandwidth sharing, contention,
    buffering, stalls and compute/communication overlap. Add small hand-worked
