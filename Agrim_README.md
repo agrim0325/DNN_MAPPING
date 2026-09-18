@@ -1,4 +1,4 @@
-# 🚀 Agrim's Breakthroughs & Project Upgrades
+
 
 This document summarizes the massive architectural overhauls, mathematical fixes, and algorithmic upgrades implemented to make this Multi-Chip Mapping project "paper-perfect" and publication-ready. 
 
